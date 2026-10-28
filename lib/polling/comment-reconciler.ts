@@ -8,9 +8,13 @@
  *
  * This sweep is deliberately narrow. For each active campaign it looks only at
  * that campaign's post, only at recent comments, and acts on a comment ONLY when
- * both are true:
- *   1. the comment matches the campaign keyword, and
- *   2. the account owner has not already replied to it.
+ * all three are true:
+ *   1. the comment matches the campaign keyword,
+ *   2. the account owner has not already replied to it, and
+ *   3. the worker has not already settled it — sent, or failed and given up.
+ * Condition 3 is what keeps the sweep from re-running the worker's retries: a
+ * comment whose DM fails permanently would otherwise come back every five
+ * minutes forever.
  * The reply check reads the comment's actual replies on Instagram, so a comment
  * you (or the tool) already answered is skipped — the poll never re-touches
  * handled comments. Each sweep is capped so it can never flood the comment API
@@ -229,24 +233,42 @@ async function sweepCampaign({
     });
     if (needsAction.length === 0) continue;
 
-    // Second guard against races: skip comments this campaign has already fully
-    // handled. "Fully handled" depends on the campaign: if it posts a public
-    // reply, the completion signal is publicReplySentAt (a DM alone is not
-    // enough — the reply still has to land); otherwise a SENT DM is enough. This
-    // is what lets a comment whose DM sent but whose public reply failed come
-    // back and retry the reply.
-    const handled = await prisma.dmLog.findMany({
+    // Second guard against races: skip comments this campaign has already
+    // settled — either fully handled, or given up on.
+    //
+    // "Fully handled" depends on the campaign: if it posts a public reply, the
+    // completion signal is publicReplySentAt (a DM alone is not enough — the
+    // reply still has to land); otherwise a SENT DM is enough. This is what lets
+    // a comment whose DM sent but whose public reply failed come back and retry
+    // the reply.
+    //
+    // "Given up on" is a FAILED row. The worker already received this comment
+    // and already exhausted its own retries against it, so re-enqueueing adds no
+    // information: nothing about a permanent failure (messaging closed, the
+    // comment's single private reply consumed, recipient blocked) changes in
+    // five minutes. Worse, Meta's generic errors do not prove non-delivery, so
+    // every lap can reach the recipient again — one comment failing this way
+    // sent ~400 DM attempts to a single person over 11 hours before this guard
+    // existed. This sweep is for comments the webhook never delivered at all;
+    // those have no DmLog row. Retrying the ones it did deliver is the worker's
+    // job, not this one's.
+    const settled = await prisma.dmLog.findMany({
       where: {
         automationId: automation.id,
         commentId: { in: needsAction.map((c) => c.id) },
-        AND: [
-          { OR: [{ status: "SENT" }, { dmDeliveryUnconfirmed: true }] },
-          ...(automation.publicReplyEnabled ? [{ OR: [{ publicReplySentAt: { not: null } }, { publicReplyDeliveryUnconfirmed: true }] }] : []),
+        OR: [
+          {
+            AND: [
+              { OR: [{ status: "SENT" }, { dmDeliveryUnconfirmed: true }] },
+              ...(automation.publicReplyEnabled ? [{ OR: [{ publicReplySentAt: { not: null } }, { publicReplyDeliveryUnconfirmed: true }] }] : []),
+            ],
+          },
+          { status: "FAILED" },
         ],
       },
       select: { commentId: true },
     });
-    const handledSet = new Set(handled.map((h) => h.commentId));
+    const handledSet = new Set(settled.map((h) => h.commentId));
 
     // Oldest first, so whoever commented earliest gets answered first, capped.
     const fresh = needsAction
